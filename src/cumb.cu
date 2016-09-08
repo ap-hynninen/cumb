@@ -60,27 +60,48 @@ __global__ void pChaseKernel(T* array) {
       j = array[j];
       dummy[it] = j;
       int end = clock();
-//       int dur = end - start;
-// #pragma unroll
-//       for (int i=16;i >= 1;i/=2) {
-//         dur += __shfl_xor(dur, i);
-//       }
-//       if (threadIdx.x == 0) duration[it] = dur/2;
       duration[it] = end - start;
     }
   }
 
   if (threadIdx.x == 0) {
     int total_duration = 0;
+    int total_duration2 = 0;
     int total_dummy = 0;
     for (int it=1;it < niter;it++) {
-      total_duration += duration[it];
+      int d = duration[it];
+      total_duration += d;
+      total_duration2 += d*d;
       total_dummy += (int)dummy[it];
     }
-    printf("%1.2f %d\n", (float)total_duration/(float)niter, total_dummy);
+    float avg_duration = (float)total_duration/(float)(niter - 1);
+    float avg_duration2 = (float)total_duration2/(float)(niter - 1);
+    float std_duration = sqrtf(avg_duration2 - avg_duration*avg_duration);
+    printf("%1.2f %1.2f %d\n", avg_duration, std_duration, total_dummy);
     // for (int it=0;it < niter;it++) {
     //   printf("%d %d\n", duration[it], (int)dummy[it]);
     // }
+  }
+}
+
+template <typename T>
+__global__ void pChaseMaxwellKernel(T* array, const int niter) {
+  
+  extern __shared__ T dummy[];
+
+  long long int start = clock64();
+  T j = threadIdx.x*32;
+  for (int it=0;it < niter;it++) {
+    j = array[j];
+    dummy[it] = j;
+  }
+  long long int end = clock64();
+  int duration = (int)(end - start);
+
+  if (threadIdx.x == 0) {
+    int total_dummy = 0;
+    for (int it=0;it < niter;it++) total_dummy += dummy[it];
+    printf("%1.2f %d\n", (float)duration/(float)niter, total_dummy);
   }
 }
 
@@ -187,6 +208,8 @@ __global__ void cacheLineKernel(double* buffer, double* res) {
 // ############################################################################
 // ############################################################################
 
+static int SM_major = 0;
+
 template <typename T> void pChase(int stride);
 void memoryTransactions();
 template <typename T> void memoryLatency(int nwarp, int nsm);
@@ -195,6 +218,7 @@ void cyclesPerOperation();
 template <typename T> void memoryWrite(int stride, int offset);
 void memoryWrite2(int stride, int offset);
 void cacheLine();
+void printDeviceInfo();
 
 int main(int argc, char *argv[]) {
 
@@ -226,6 +250,9 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  cudaCheck(cudaSetDevice(0));
+  printDeviceInfo();
+
   int* buffer = NULL;
   int bufferSize = 1000000;
   allocate_device<int>(&buffer, bufferSize);
@@ -244,9 +271,14 @@ int main(int argc, char *argv[]) {
   // clearCache(buffer, bufferSize);
   // memoryTransactions();
 
-  for (int i=1;i <= 32;i++) {
+  if (stride == 0) {
+    for (int i=1;i <= 32;i++) {
+      clearCache(buffer, bufferSize);
+      pChase<int>(i);
+    }
+  } else {
     clearCache(buffer, bufferSize);
-    pChase<int>(i);
+    pChase<int>(stride);
   }
 
   // clearCache(buffer, bufferSize);
@@ -269,7 +301,7 @@ int main(int argc, char *argv[]) {
 template <typename T>
 void pChase(int stride) {
   int nthread = stride;
-  int arraySize = 32*1024*1024/sizeof(T);
+  int arraySize = 320*1024*1024/sizeof(T);
   T* array;
   allocate_device<T>(&array, arraySize);
   T* h_array = new T[arraySize];
@@ -295,7 +327,11 @@ void pChase(int stride) {
   cudaCheck(cudaDeviceSynchronize());
   delete [] h_array;
 
-  pChaseKernel<T, 32> <<< 1, nthread >>>(array);
+  if (SM_major >= 5) {
+    pChaseMaxwellKernel<T> <<< 1, nthread, 320*sizeof(T) >>>(array, 320);
+  } else {
+    pChaseKernel<T, 320> <<< 1, nthread >>>(array);
+  }
   cudaCheck(cudaGetLastError());
 
   cudaCheck(cudaDeviceSynchronize());
@@ -448,4 +484,21 @@ void cyclesPerOperation() {
   cudaCheck(cudaGetLastError());
 
   cudaCheck(cudaDeviceSynchronize());  
+}
+
+void printDeviceInfo() {
+  int deviceID;
+  cudaCheck(cudaGetDevice(&deviceID));
+  cudaDeviceProp prop;
+  cudaCheck(cudaGetDeviceProperties(&prop, deviceID));
+  cudaSharedMemConfig pConfig;
+  cudaCheck(cudaDeviceGetSharedMemConfig(&pConfig));
+  int shMemBankSize = 4;
+  if (pConfig == cudaSharedMemBankSizeEightByte) shMemBankSize = 8;
+  double mem_BW = (double)(prop.memoryClockRate*2*(prop.memoryBusWidth/8))/1.0e6;
+  SM_major = prop.major;
+  printf("Using %s SM version %d.%d\n", prop.name, prop.major, prop.minor);
+  printf("Clock %1.3lfGhz numSM %d ECC %d mem BW %1.2lfGB/s shMemBankSize %dB\n", (double)prop.clockRate/1e6,
+	 prop.multiProcessorCount, prop.ECCEnabled, mem_BW, shMemBankSize);
+  printf("L2 %1.2lfMB\n", (double)prop.l2CacheSize/(double)(1024*1024));
 }
