@@ -36,7 +36,7 @@ GENCODE_SM35  := -gencode arch=compute_35,code=sm_35
 GENCODE_SM52  := -gencode arch=compute_52,code=sm_52
 GENCODE_FLAGS := $(GENCODE_SM35) $(GENCODE_SM52)
 
-# GENCODE_FLAGS := -arch=sm_35
+# GENCODE_FLAGS := -arch=sm_52
 #######################################################
 
 # Detect OS

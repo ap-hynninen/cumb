@@ -89,13 +89,13 @@ __global__ void pChaseMaxwellKernel(T* array, const int niter) {
   
   extern __shared__ T dummy[];
 
-  long long int start = clock64();
+  int start = clock();
   T j = threadIdx.x*32;
   for (int it=0;it < niter;it++) {
     j = array[j];
     dummy[it] = j;
   }
-  long long int end = clock64();
+  int end = clock();
   int duration = (int)(end - start);
 
   if (threadIdx.x == 0) {
@@ -224,6 +224,7 @@ int main(int argc, char *argv[]) {
 
   int stride = 1;
   int offset = 0;
+  int deviceID = 0;
   bool arg_ok = true;
   if (argc >= 2) {
     int i = 1;
@@ -233,6 +234,9 @@ int main(int argc, char *argv[]) {
         i += 2;
       } else if (strcmp(argv[i], "-offset") == 0) {
         sscanf(argv[i+1], "%d", &offset);
+        i += 2;
+      } else if (strcmp(argv[i], "-device") == 0) {
+        sscanf(argv[i+1], "%d", &deviceID);
         i += 2;
       } else {
         arg_ok = false;
@@ -246,11 +250,13 @@ int main(int argc, char *argv[]) {
   if (!arg_ok) {
     printf("cumb [options]\n");
     printf("Options:\n");
-    printf("-stride\n");
+    printf("-stride [stride]\n");
+    printf("-offset [offset]\n");
+    printf("-device [device]\n");
     return 1;
   }
 
-  cudaCheck(cudaSetDevice(0));
+  cudaCheck(cudaSetDevice(deviceID));
   printDeviceInfo();
 
   int* buffer = NULL;
