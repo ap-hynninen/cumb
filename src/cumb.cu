@@ -104,9 +104,35 @@ __global__ void pChaseMaxwellKernel(T* array, const int niter) {
   int duration = (int)(end - start);
 
   if (threadIdx.x == 0) {
-    int total_dummy = 0;
-    for (int it=0;it < niter;it++) total_dummy += dummy[it];
-    printf("%1.2f %d\n", (float)duration/(float)niter, total_dummy);
+    int max_dummy = 0;
+    for (int it=0;it < niter;it++) max_dummy = max(max_dummy, (int)dummy[it]);
+    printf("%1.2f %d\n", (float)duration/(float)niter, max_dummy);
+  }
+}
+
+template <typename T>
+__global__ void pChaseMaxwellKernel2(T* array, const int niter) {
+  
+  extern __shared__ char dummychar[];
+  volatile T* dummy = (T*)dummychar;
+
+  int start = clock();
+  T j = threadIdx.x*32;
+  for (int it=0;it < niter;it++) {
+    j = array[j];
+    dummy[it*blockDim.x + threadIdx.x] = j;
+  }
+  int end = clock();
+  int duration = (int)(end - start);
+
+  if (threadIdx.x == 0) {
+    int max_dummy = 0;
+    for (int it=0;it < niter;it++) {
+      for (int t=0;t < blockDim.x;t++) {
+        max_dummy = max(max_dummy, (int)dummy[it*blockDim.x + t]);
+      }
+    }
+    printf("%1.2f %d\n", (float)duration/(float)niter, max_dummy);
   }
 }
 
@@ -345,9 +371,9 @@ int main(int argc, char *argv[]) {
   // clearCache(buffer, bufferSize);
   // copyPCL(nthread, niter);
 
-  volMmk(nthread, file);
+  // volMmk(nthread, file);
 
-#if 0
+#if 1
   if (nthread == 0) {
     for (int i=1;i <= 32;i++) {
       clearCache(buffer, bufferSize);
@@ -458,9 +484,15 @@ int glTransactions(const int* pos, const int n, const int accWidth) {
   return count;
 }
 
+//
+// Stride = stride in bytes
+//
 template <typename T>
 void pChase(int nthread, int stride, int offset) {
-  int arraySize = 320*1024*1024/sizeof(T);
+  int niter = 320;
+  int skip = stride/sizeof(T);
+  int arraySize = (niter + 1)*skip*nthread;
+  // printf("arraySize %dMB\n", arraySize*sizeof(T)/(1024*1024));
   T* array;
   allocate_device<T>(&array, arraySize);
   T* h_array = new T[arraySize];
@@ -472,36 +504,38 @@ void pChase(int nthread, int stride, int offset) {
   //   int ithread = i % nthread;
   //   h_array[i] = (T)((iblock + stride)*nthread + ithread) % arraySize;
   // }
-  int skip = stride/sizeof(T);
-  for (int i=0;i < arraySize;i+=skip) {
+  for (int i=0;i < niter*skip*nthread;i+=skip) {
+    if (skip*nthread + i + offset > arraySize) {
+      printf("ERROR\n");
+    }
     h_array[i + offset] = (skip*nthread + i + offset) % arraySize;
   }
   
-  int k = 0;
-  for (int j=0;j < 33;j++) {
-    for (int i=0;i < 32;i++) {
-      int val = (int)h_array[k++];
-      if (val < 0) {
-        printf("X ");
-      } else {
-        printf("%d ", val);
-      }
-    }
-    printf("\n");
-  }
+  // int k = 0;
+  // for (int j=0;j < 33;j++) {
+  //   for (int i=0;i < 32;i++) {
+  //     int val = (int)h_array[k++];
+  //     if (val < 0) {
+  //       printf("X ");
+  //     } else {
+  //       printf("%d ", val);
+  //     }
+  //   }
+  //   printf("\n");
+  // }
   
   int* pos = new int[nthread];
   for (int t=0;t < nthread;t++) {
     pos[t] = t*skip;
   }
-  for (int t=0;t < nthread;t++) {
-    printf("%d ", pos[t]);
-  }
-  printf("\n");
+  // for (int t=0;t < nthread;t++) {
+  //   printf("%d ", pos[t]);
+  // }
+  // printf("\n");
 
-  int accWidth = 128/sizeof(T);
-  int tran = glTransactions(pos, nthread, accWidth);
-  printf("tran %d\n", tran);
+  // int accWidth = 128/sizeof(T);
+  // int tran = glTransactions(pos, nthread, accWidth);
+  // printf("tran %d\n", tran);
 
   delete [] pos;
 
@@ -510,7 +544,8 @@ void pChase(int nthread, int stride, int offset) {
   delete [] h_array;
 
   if (SM_major >= 5) {
-    pChaseMaxwellKernel<T> <<< 1, nthread, 320*sizeof(T) >>>(array, 320);
+    pChaseMaxwellKernel<T> <<< 1, nthread, niter*sizeof(T) >>>(array, niter);
+    // pChaseMaxwellKernel2<T> <<< 1, nthread, niter*sizeof(T)*nthread >>>(array, niter);
   } else {
     pChaseKernel<T, 320> <<< 1, nthread >>>(array, skip, offset);
   }
