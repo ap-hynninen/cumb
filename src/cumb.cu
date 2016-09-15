@@ -29,6 +29,7 @@ SOFTWARE.
 
 #include <cstdio>
 #include "CudaUtils.h"
+#include "cumbUtils.h"
 
 __global__ void clearCacheKernel(int* buffer, const int bufferSize) {
   for (int t=threadIdx.x + blockIdx.x*blockDim.x;t < bufferSize;t+=blockDim.x*gridDim.x) {
@@ -48,13 +49,13 @@ __global__ void memoryTransactionKernel(T* buffer) {
 }
 
 template <typename T, int niter>
-__global__ void pChaseKernel(T* array) {
+__global__ void pChaseKernel(T* array, const int skip, const int offset) {
   
   __shared__ int duration[niter];
   __shared__ T dummy[niter];
 
   {
-    T j = threadIdx.x*32;
+    T j = threadIdx.x*skip + offset;
     for (int it=0;it < niter;it++) {
       int start = clock();
       j = array[j];
@@ -65,6 +66,7 @@ __global__ void pChaseKernel(T* array) {
   }
 
   if (threadIdx.x == 0) {
+#if 1
     int total_duration = 0;
     int total_duration2 = 0;
     int total_dummy = 0;
@@ -78,16 +80,19 @@ __global__ void pChaseKernel(T* array) {
     float avg_duration2 = (float)total_duration2/(float)(niter - 1);
     float std_duration = sqrtf(avg_duration2 - avg_duration*avg_duration);
     printf("%1.2f %1.2f %d\n", avg_duration, std_duration, total_dummy);
-    // for (int it=0;it < niter;it++) {
-    //   printf("%d %d\n", duration[it], (int)dummy[it]);
-    // }
+#else
+    for (int it=0;it < niter;it++) {
+      printf("%d %d\n", duration[it], (int)dummy[it]);
+    }
+#endif
   }
 }
 
 template <typename T>
 __global__ void pChaseMaxwellKernel(T* array, const int niter) {
   
-  extern __shared__ T dummy[];
+  extern __shared__ char dummychar[];
+  T* dummy = (T*)dummychar;
 
   int start = clock();
   T j = threadIdx.x*32;
@@ -102,6 +107,22 @@ __global__ void pChaseMaxwellKernel(T* array, const int niter) {
     int total_dummy = 0;
     for (int it=0;it < niter;it++) total_dummy += dummy[it];
     printf("%1.2f %d\n", (float)duration/(float)niter, total_dummy);
+  }
+}
+
+__global__ void writePCLKernel(int* array, const int niter) {
+  for (int it=0;it < niter;it++) {
+    array[it*32 + threadIdx.x] = 1;
+  }
+}
+
+__global__ void copyPCLKernel(int* src, int* dst, const int niter) {
+  __shared__ int shbuf[32];
+  for (int it=0;it < niter;it++) {
+    __syncthreads();
+    shbuf[threadIdx.x] = src[it*32 + threadIdx.x];
+    __syncthreads();
+    dst[it*32 + threadIdx.x] = shbuf[threadIdx.x];
   }
 }
 
@@ -152,13 +173,6 @@ __global__ void memoryLatencyKernel2(T* bufferOut) {
   }
 }
 
-// __global__ void memoryReadKernel(int* buffer, const int nread, const int stride) {
-//   int a;
-//   for (int t=threadIdx.x + blockIdx.x*blockDim.x;t < nread;t+=blockDim.x*gridDim.x) {
-//     a = buffer[t*stride];
-//   }
-// }
-
 template <typename T>
 __global__ void memoryWriteKernel(T* buffer, const int nwrite, const int stride, const int offset) {
   // for (int t=threadIdx.x + blockIdx.x*blockDim.x;t < nwrite;t+=blockDim.x*gridDim.x) {
@@ -204,13 +218,41 @@ __global__ void cacheLineKernel(double* buffer, double* res) {
   if (threadIdx.x == 0) res[0] = sum;
 }
 
+__global__ void writeVolMmk(const int* pos, const int n, double* buffer) {
+  for (int i=threadIdx.x;i < n;i+=blockDim.x) {
+    int posval = pos[i];
+    buffer[posval] = 1.0;
+  }
+}
+
+__global__ void readWriteVolMmk(const int* posr, const int* posw, const int n, double* buffer) {
+  extern __shared__ double shBuffer[];
+
+  __syncthreads();
+
+  for (int i=threadIdx.x;i < n;i+=blockDim.x) {
+    int posr_val = posr[i];
+    shBuffer[i] = buffer[posr_val];
+  }
+
+  __syncthreads();
+
+  for (int i=threadIdx.x;i < n;i+=blockDim.x) {
+    int posw_val = posw[i];
+    buffer[posw_val] = shBuffer[i];
+  }
+}
+
 // ############################################################################
 // ############################################################################
 // ############################################################################
 
 static int SM_major = 0;
 
-template <typename T> void pChase(int stride);
+void volMmk(int nthread, char* filebase);
+void copyPCL(int nthread, int niter);
+void writePCL(int nthread, int niter);
+template <typename T> void pChase(int nthread, int stride, int offset);
 void memoryTransactions();
 template <typename T> void memoryLatency(int nwarp, int nsm);
 void clearCache(int* buffer, const int bufferSize);
@@ -222,9 +264,13 @@ void printDeviceInfo();
 
 int main(int argc, char *argv[]) {
 
+  int nthread = 1;
   int stride = 1;
   int offset = 0;
+  int niter = 0;
   int deviceID = 0;
+  int size = 4;
+  char file[64];
   bool arg_ok = true;
   if (argc >= 2) {
     int i = 1;
@@ -232,8 +278,20 @@ int main(int argc, char *argv[]) {
       if (strcmp(argv[i], "-stride") == 0) {
         sscanf(argv[i+1], "%d", &stride);
         i += 2;
+      } else if (strcmp(argv[i], "-nthread") == 0) {
+        sscanf(argv[i+1], "%d", &nthread);
+        i += 2;
       } else if (strcmp(argv[i], "-offset") == 0) {
         sscanf(argv[i+1], "%d", &offset);
+        i += 2;
+      } else if (strcmp(argv[i], "-size") == 0) {
+        sscanf(argv[i+1], "%d", &size);
+        i += 2;
+      } else if (strcmp(argv[i], "-niter") == 0) {
+        sscanf(argv[i+1], "%d", &niter);
+        i += 2;
+      } else if (strcmp(argv[i], "-file") == 0) {
+        sscanf(argv[i+1], "%s", file);
         i += 2;
       } else if (strcmp(argv[i], "-device") == 0) {
         sscanf(argv[i+1], "%d", &deviceID);
@@ -250,8 +308,12 @@ int main(int argc, char *argv[]) {
   if (!arg_ok) {
     printf("cumb [options]\n");
     printf("Options:\n");
+    printf("-nthread [nthread]\n");
     printf("-stride [stride]\n");
     printf("-offset [offset]\n");
+    printf("-size [size]\n");
+    printf("-niter [niter]\n");
+    printf("-file [file]\n");
     printf("-device [device]\n");
     return 1;
   }
@@ -277,15 +339,31 @@ int main(int argc, char *argv[]) {
   // clearCache(buffer, bufferSize);
   // memoryTransactions();
 
-  if (stride == 0) {
+  // clearCache(buffer, bufferSize);
+  // writePCL(nthread, niter);
+
+  // clearCache(buffer, bufferSize);
+  // copyPCL(nthread, niter);
+
+  volMmk(nthread, file);
+
+#if 0
+  if (nthread == 0) {
     for (int i=1;i <= 32;i++) {
       clearCache(buffer, bufferSize);
-      pChase<int>(i);
+      if (size == 4)
+        pChase<int>(i, stride, offset);
+      else
+        pChase<long long int>(i, stride, offset);
     }
   } else {
     clearCache(buffer, bufferSize);
-    pChase<int>(stride);
+    if (size == 4)
+      pChase<int>(nthread, stride, offset);
+    else
+      pChase<long long int>(nthread, stride, offset);
   }
+#endif
 
   // clearCache(buffer, bufferSize);
   // pChase<long long int>(stride);
@@ -304,9 +382,84 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
+void volMmk(int nthread, char* filebase) {
+  char filename[256];
+  sprintf(filename, "%sr.txt", filebase);
+  std::vector<int> h_posr = loadPos(filename);
+  sprintf(filename, "%sw.txt", filebase);
+  std::vector<int> h_posw = loadPos(filename);
+
+  if (h_posr.size() == 0 || h_posr.size() != h_posw.size()) return;
+
+  int* posr;
+  int* posw;
+  allocate_device<int>(&posr, h_posr.size());
+  allocate_device<int>(&posw, h_posw.size());
+  copy_HtoD_sync<int>(h_posr.data(), posr, h_posr.size());
+  copy_HtoD_sync<int>(h_posw.data(), posw, h_posw.size());
+
+  int maxpos = std::max(h_posr.back(), h_posw.back());
+  double* buffer;
+  allocate_device<double>(&buffer, maxpos + 1);
+
+  // writeVolMmk<<< 1, nthread >>>(posw, h_posw.size(), buffer);
+  readWriteVolMmk<<< 1, nthread, h_posr.size()*sizeof(double) >>>(posr, posw, h_posw.size(), buffer);
+  cudaCheck(cudaGetLastError());
+
+  cudaCheck(cudaDeviceSynchronize());
+
+  deallocate_device<int>(&posr);
+  deallocate_device<int>(&posw);
+  deallocate_device<double>(&buffer);
+}
+
+void copyPCL(int nthread, int niter) {
+  int arraySize = 32*1024*1024;
+  int* arraySrc;
+  int* arrayDst;
+  allocate_device<int>(&arraySrc, arraySize);
+  allocate_device<int>(&arrayDst, arraySize);
+
+  copyPCLKernel<<< 1, nthread >>>(arraySrc, arrayDst, niter);
+  cudaCheck(cudaGetLastError());
+
+  cudaCheck(cudaDeviceSynchronize());
+
+  deallocate_device<int>(&arraySrc);
+  deallocate_device<int>(&arrayDst);
+}
+
+void writePCL(int nthread, int niter) {
+  int arraySize = 32*1024*1024;
+  int* array;
+  allocate_device<int>(&array, arraySize);
+
+  writePCLKernel<<< 1, nthread >>>(array, niter);
+  cudaCheck(cudaGetLastError());
+
+  cudaCheck(cudaDeviceSynchronize());
+
+  deallocate_device<int>(&array);
+}
+
+//
+// Count number of global memory transactions per one request for potentially
+// scattered accesses to elements listed in pos
+// NOTE: Assumes pos is sorted
+//
+int glTransactions(const int* pos, const int n, const int accWidth) {
+  int count = 0;
+  int iseg_prev = -1;
+  for (int i=0;i < n;i++) {
+    int iseg = pos[i]/accWidth;
+    count += (iseg != iseg_prev);
+    iseg_prev = iseg;
+  }
+  return count;
+}
+
 template <typename T>
-void pChase(int stride) {
-  int nthread = stride;
+void pChase(int nthread, int stride, int offset) {
   int arraySize = 320*1024*1024/sizeof(T);
   T* array;
   allocate_device<T>(&array, arraySize);
@@ -319,16 +472,39 @@ void pChase(int stride) {
   //   int ithread = i % nthread;
   //   h_array[i] = (T)((iblock + stride)*nthread + ithread) % arraySize;
   // }
-  for (int i=0;i < arraySize;i+=32) {
-    h_array[i] = (32*nthread + i) % arraySize;
+  int skip = stride/sizeof(T);
+  for (int i=0;i < arraySize;i+=skip) {
+    h_array[i + offset] = (skip*nthread + i + offset) % arraySize;
   }
-  // int k = 0;
-  // for (int j=0;j < 33;j++) {
-  //   for (int i=0;i < 32;i++) {
-  //     printf("%d ", (int)h_array[k++]);
-  //   }
-  //   printf("\n");
-  // }
+  
+  int k = 0;
+  for (int j=0;j < 33;j++) {
+    for (int i=0;i < 32;i++) {
+      int val = (int)h_array[k++];
+      if (val < 0) {
+        printf("X ");
+      } else {
+        printf("%d ", val);
+      }
+    }
+    printf("\n");
+  }
+  
+  int* pos = new int[nthread];
+  for (int t=0;t < nthread;t++) {
+    pos[t] = t*skip;
+  }
+  for (int t=0;t < nthread;t++) {
+    printf("%d ", pos[t]);
+  }
+  printf("\n");
+
+  int accWidth = 128/sizeof(T);
+  int tran = glTransactions(pos, nthread, accWidth);
+  printf("tran %d\n", tran);
+
+  delete [] pos;
+
   copy_HtoD_sync<T>(h_array, array, arraySize);
   cudaCheck(cudaDeviceSynchronize());
   delete [] h_array;
@@ -336,7 +512,7 @@ void pChase(int stride) {
   if (SM_major >= 5) {
     pChaseMaxwellKernel<T> <<< 1, nthread, 320*sizeof(T) >>>(array, 320);
   } else {
-    pChaseKernel<T, 320> <<< 1, nthread >>>(array);
+    pChaseKernel<T, 320> <<< 1, nthread >>>(array, skip, offset);
   }
   cudaCheck(cudaGetLastError());
 

@@ -58,7 +58,7 @@ OPTLEV = -O0
 # Defines
 DEFS = 
 
-OBJSMB = build/cumb.o build/CudaUtils.o
+OBJSMB = build/cumb.o build/cumbUtils.o build/CudaUtils.o
 OBJS = $(OBJSMB)
 
 #CUDAROOT = $(subst /bin/,,$(dir $(shell which nvcc)))
