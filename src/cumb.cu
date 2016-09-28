@@ -89,13 +89,56 @@ __global__ void pChaseKernel(T* array, const int skip, const int offset) {
 }
 
 template <typename T>
-__global__ void pChaseMaxwellKernel(T* array, const int niter) {
+__global__ void pChaseKernel2(T* array, const int skip, const int offset, const int niter) {
+
+  extern __shared__ char dummychar[];
+  volatile int* duration = (int*)dummychar;
+  volatile T* dummy = (T*)&dummychar[niter*sizeof(int)];
+  
+  {
+    T j = threadIdx.x*skip + offset;
+    for (int it=0;it < niter;it++) {
+      // int start = clock();
+      duration[it] = clock();
+      j = array[j];
+      dummy[it*blockDim.x + threadIdx.x] = j;
+      // int end = clock();
+      // duration[it] = end - start;
+      duration[it] = clock() - duration[it];
+    }
+  }
+
+  if (threadIdx.x == 0) {
+#if 1
+    int total_duration = 0;
+    int total_duration2 = 0;
+    int total_dummy = 0;
+    for (int it=1;it < niter;it++) {
+      int d = duration[it];
+      total_duration += d;
+      total_duration2 += d*d;
+      total_dummy += (int)dummy[it];
+    }
+    float avg_duration = (float)total_duration/(float)(niter - 1);
+    float avg_duration2 = (float)total_duration2/(float)(niter - 1);
+    float std_duration = sqrtf(avg_duration2 - avg_duration*avg_duration);
+    printf("%1.2f %1.2f %d\n", avg_duration, std_duration, total_dummy);
+#else
+    for (int it=0;it < niter;it++) {
+      printf("%d %d\n", duration[it], (int)dummy[it]);
+    }
+#endif
+  }
+}
+
+template <typename T>
+__global__ void pChaseMaxwellKernel(T* array, const int skip, const int offset, const int niter) {
   
   extern __shared__ char dummychar[];
   T* dummy = (T*)dummychar;
 
   int start = clock();
-  T j = threadIdx.x*32;
+  T j = threadIdx.x*skip + offset;
   for (int it=0;it < niter;it++) {
     j = array[j];
     dummy[it] = j;
@@ -111,15 +154,17 @@ __global__ void pChaseMaxwellKernel(T* array, const int niter) {
 }
 
 template <typename T>
-__global__ void pChaseMaxwellKernel2(T* array, const int niter) {
+__global__ void pChaseMaxwellKernel2(T* array, const int skip, const int offset, const int niter) {
   
   extern __shared__ char dummychar[];
   volatile T* dummy = (T*)dummychar;
 
   int start = clock();
-  T j = threadIdx.x*32;
+  T j = threadIdx.x*skip + offset;
   for (int it=0;it < niter;it++) {
+    T j0 = j;
     j = array[j];
+    // printf("%d %d | %d -> %d\n", it, threadIdx.x, j0, j);
     dummy[it*blockDim.x + threadIdx.x] = j;
   }
   int end = clock();
@@ -491,7 +536,7 @@ template <typename T>
 void pChase(int nthread, int stride, int offset) {
   int niter = 320;
   int skip = stride/sizeof(T);
-  int arraySize = (niter + 1)*skip*nthread;
+  int arraySize = (niter + 1)*skip*nthread*100;
   // printf("arraySize %dMB\n", arraySize*sizeof(T)/(1024*1024));
   T* array;
   allocate_device<T>(&array, arraySize);
@@ -524,10 +569,10 @@ void pChase(int nthread, int stride, int offset) {
   //   printf("\n");
   // }
   
-  int* pos = new int[nthread];
-  for (int t=0;t < nthread;t++) {
-    pos[t] = t*skip;
-  }
+  // int* pos = new int[nthread];
+  // for (int t=0;t < nthread;t++) {
+  //   pos[t] = t*skip;
+  // }
   // for (int t=0;t < nthread;t++) {
   //   printf("%d ", pos[t]);
   // }
@@ -537,17 +582,18 @@ void pChase(int nthread, int stride, int offset) {
   // int tran = glTransactions(pos, nthread, accWidth);
   // printf("tran %d\n", tran);
 
-  delete [] pos;
+  // delete [] pos;
 
   copy_HtoD_sync<T>(h_array, array, arraySize);
   cudaCheck(cudaDeviceSynchronize());
   delete [] h_array;
 
   if (SM_major >= 5) {
-    pChaseMaxwellKernel<T> <<< 1, nthread, niter*sizeof(T) >>>(array, niter);
-    // pChaseMaxwellKernel2<T> <<< 1, nthread, niter*sizeof(T)*nthread >>>(array, niter);
+    pChaseMaxwellKernel<T> <<< 1, nthread, niter*sizeof(T) >>>(array, skip, offset, niter);
+    // pChaseMaxwellKernel2<T> <<< 1, nthread, niter*sizeof(T)*nthread >>>(array, skip, offset, niter);
   } else {
     pChaseKernel<T, 320> <<< 1, nthread >>>(array, skip, offset);
+    // pChaseKernel2<T> <<< 1, nthread, niter*sizeof(int) + niter*sizeof(T)*nthread >>>(array, skip, offset, niter);
   }
   cudaCheck(cudaGetLastError());
 
